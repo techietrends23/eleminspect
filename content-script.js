@@ -5,6 +5,15 @@
   if (window[contentScriptInstanceKey]) return;
   window[contentScriptInstanceKey] = true;
 
+  const HIGHLIGHT_DURATION_MS = 4000;
+  // Fuzzy or label-based locator types. The inspected element is already verified unique for these.
+  const TARGET_VERIFIED_TYPES = new Set(['text', 'label', 'placeholder', 'alt']);
+  // While the inspector is active, these events never reach the page.
+  const BLOCKED_EVENT_TYPES = [
+    'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick',
+    'contextmenu', 'auxclick', 'touchstart', 'touchend', 'keydown', 'keypress', 'keyup',
+  ];
+
   let elementInspector = null;
   let inspectorTarget = null;
   let inspectorLocked = false;
@@ -86,9 +95,10 @@
 
   function inspectorTypeLabel(type, value) {
     const normalized = String(type || 'locator').toLowerCase();
-    if (normalized === 'xpath' && /@id=|@data-testid=/.test(String(value || ''))) {
-      return 'XPath (ID anchor)';
-    }
+    const raw = String(value || '');
+    if (normalized === 'xpath' && /@id=|@data-testid=/.test(raw)) return 'XPath (ID anchor)';
+    if (normalized === 'xpath' && /^\/html\[\d+\]\//.test(raw)) return 'XPath (absolute)';
+    if (normalized === 'xpath') return 'XPath';
     const labels = {
       id: 'Unique ID', testid: 'Test ID', role: 'Role', label: 'Label', placeholder: 'Placeholder',
       alt: 'Alt text', text: 'Text', css: 'CSS', xpath: 'XPath', name: 'Name',
@@ -167,162 +177,127 @@
     return { error: `Unsupported locator type: ${normalizedType}`, matches: [] };
   }
 
-  function clearInspectorLocatorHighlights() {
-    if (!elementInspector) return;
-    if (elementInspector.highlightTimer) {
-      clearTimeout(elementInspector.highlightTimer);
-      elementInspector.highlightTimer = null;
-    }
-    if (elementInspector.highlightRefreshTimer) {
-      clearInterval(elementInspector.highlightRefreshTimer);
-      elementInspector.highlightRefreshTimer = null;
-    }
-    if (elementInspector.highlightLayer) {
-      elementInspector.highlightLayer.replaceChildren();
-      elementInspector.highlightLayer.style.display = 'none';
-    }
-    elementInspector.highlightNodes = [];
-    elementInspector.frozenHighlightRects = [];
-  }
-
   function ensureInspectorHighlightStyles() {
     if (document.getElementById('web-recorder-inspector-highlight-style')) return;
     const style = document.createElement('style');
     style.id = 'web-recorder-inspector-highlight-style';
     style.textContent = `
-      @keyframes web-recorder-inspector-locator-flash {
-        0%, 100% { opacity: 1; box-shadow: 0 0 0 2px rgba(192, 38, 211, 0.95); }
-        50% { opacity: 0.3; box-shadow: 0 0 0 6px rgba(192, 38, 211, 0.35); }
+      @keyframes web-recorder-inspector-blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.15; }
       }
       [data-web-recorder-inspector="locator-highlight"] {
-        animation: web-recorder-inspector-locator-flash 0.8s ease-in-out infinite;
+        animation: web-recorder-inspector-blink 0.5s ease-in-out infinite;
         border: 2px solid #c026d3;
         background: rgba(192, 38, 211, 0.22);
+        box-shadow: 0 0 0 3px rgba(192, 38, 211, 0.35);
+        border-radius: 3px;
       }
     `;
     document.documentElement.append(style);
   }
 
-  function captureVisibleMatchRects(nodes) {
-    return (Array.isArray(nodes) ? nodes : []).map((node) => {
-      if (!node || typeof node.getBoundingClientRect !== 'function') return null;
-      const rect = node.getBoundingClientRect();
-      if (!rect.width && !rect.height) return null;
-      return {
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-      };
-    }).filter(Boolean);
+  function clearInspectorLocatorHighlights() {
+    if (!elementInspector) return;
+    const session = elementInspector.highlightSession;
+    if (session) {
+      cancelAnimationFrame(session.frameId);
+      clearTimeout(session.timerId);
+      session.boxes.forEach((box) => box.remove());
+      elementInspector.highlightSession = null;
+    }
+    if (elementInspector.highlightLayer) {
+      elementInspector.highlightLayer.style.display = 'none';
+    }
   }
 
-  function renderInspectorLocatorHighlightRects(rects) {
-    if (!elementInspector?.highlightLayer) return;
-    const layer = elementInspector.highlightLayer;
-    layer.replaceChildren();
-    if (!rects.length) {
-      layer.style.display = 'none';
-      return;
-    }
+  // One persistent box per element. A rAF loop keeps the boxes on their elements while the page scrolls or moves.
+  // The blink is a CSS animation on the box, so the boxes are never rebuilt while it runs.
+  function showInspectorLocatorHighlights(nodes) {
+    if (!elementInspector) return { error: 'Inspector is not active.', count: 0 };
+    clearInspectorLocatorHighlights();
+    const targets = nodes.filter((node) => node && node.isConnected && typeof node.getBoundingClientRect === 'function');
+    if (!targets.length) return { error: 'No elements matched this locator.', count: 0 };
 
     ensureInspectorHighlightStyles();
-    rects.forEach((rect) => {
+    targets[0].scrollIntoView({ block: 'center', inline: 'center' });
+
+    const { highlightLayer } = elementInspector;
+    const boxes = targets.map(() => {
       const box = document.createElement('div');
       box.setAttribute('data-web-recorder-inspector', 'locator-highlight');
       Object.assign(box.style, {
-        position: 'fixed',
-        pointerEvents: 'none',
-        boxSizing: 'border-box',
-        borderRadius: '3px',
-        left: `${rect.left}px`,
-        top: `${rect.top}px`,
-        width: `${rect.width}px`,
-        height: `${rect.height}px`,
+        position: 'fixed', pointerEvents: 'none', boxSizing: 'border-box', display: 'none',
       });
-      layer.append(box);
+      highlightLayer.append(box);
+      return box;
     });
-    layer.style.display = layer.childElementCount ? 'block' : 'none';
-  }
+    highlightLayer.style.display = 'block';
 
-  function positionInspectorLocatorHighlights(matches) {
-    renderInspectorLocatorHighlightRects(captureVisibleMatchRects(matches));
-  }
-
-  function showInspectorLocatorHighlights(matches, durationMs = 5000) {
-    if (!elementInspector) return 0;
-    clearInspectorLocatorHighlights();
-    const nodes = Array.isArray(matches) ? matches.filter(Boolean) : [];
-    const frozenRects = captureVisibleMatchRects(nodes);
-    if (!frozenRects.length && inspectorTarget instanceof Element) {
-      frozenRects.push(...captureVisibleMatchRects([inspectorTarget]));
-    }
-    if (!frozenRects.length) return 0;
-
-    elementInspector.highlightNodes = nodes;
-    elementInspector.frozenHighlightRects = frozenRects;
-    renderInspectorLocatorHighlightRects(frozenRects);
-
-    const refreshHighlights = () => {
-      const liveRects = captureVisibleMatchRects(
-        (elementInspector.highlightNodes || []).filter((node) => node?.isConnected),
-      );
-      if (liveRects.length) {
-        renderInspectorLocatorHighlightRects(liveRects);
-        return;
-      }
-      renderInspectorLocatorHighlightRects(elementInspector.frozenHighlightRects || []);
+    const session = { targets, boxes, frameId: 0, timerId: 0 };
+    const follow = () => {
+      if (!elementInspector || elementInspector.highlightSession !== session) return;
+      targets.forEach((node, index) => {
+        const box = boxes[index];
+        const rect = node.isConnected ? node.getBoundingClientRect() : null;
+        if (!rect || (!rect.width && !rect.height)) {
+          box.style.display = 'none';
+          return;
+        }
+        Object.assign(box.style, {
+          display: 'block',
+          left: `${rect.left}px`,
+          top: `${rect.top}px`,
+          width: `${rect.width}px`,
+          height: `${rect.height}px`,
+        });
+      });
+      session.frameId = requestAnimationFrame(follow);
     };
-
-    elementInspector.highlightRefreshTimer = setInterval(refreshHighlights, 150);
-    elementInspector.highlightTimer = setTimeout(() => {
-      clearInspectorLocatorHighlights();
-    }, durationMs);
-
-    return nodes.length || frozenRects.length;
+    elementInspector.highlightSession = session;
+    session.timerId = setTimeout(clearInspectorLocatorHighlights, HIGHLIGHT_DURATION_MS);
+    follow();
+    return { error: null, count: targets.length };
   }
 
-  function highlightSuggestedLocator(type, value) {
-    const result = queryAllInspectorLocatorMatches(type, value);
-    if (result.error) return { error: result.error, count: 0 };
-    const matches = Array.isArray(result.matches) ? result.matches : [];
-    const count = showInspectorLocatorHighlights(matches);
-    if (!count) return { error: 'No visible matches to highlight.', count: 0 };
-    return { error: null, count: matches.length || count };
+  // Resolves a suggested locator to the elements it points at.
+  // Fuzzy types (text, label, placeholder, alt) use the inspected element, which was already verified unique.
+  function resolveLocatorItemNodes(item) {
+    const type = String(item?.type || '').toLowerCase();
+    if (TARGET_VERIFIED_TYPES.has(type)) {
+      return { error: null, nodes: inspectorTarget ? [inspectorTarget] : [] };
+    }
+    const result = queryAllInspectorLocatorMatches(type, item.value);
+    if (result.error) return { error: result.error, nodes: [] };
+    const nodes = Array.from(new Set((result.matches || []).filter((node) => node instanceof Element)));
+    return { error: null, nodes };
   }
 
-  function handleInspectorLocatorHighlight(event, highlightButton) {
-    if (!highlightButton || !elementInspector?.locatorItems) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.stopImmediatePropagation) event.stopImmediatePropagation();
-
-    inspectorLocked = true;
-    document.documentElement.style.cursor = '';
-
-    const index = Number(highlightButton.dataset.inspectorHighlightIndex);
-    const item = elementInspector.locatorItems[index];
-    if (!item) return;
-
-    const result = highlightSuggestedLocator(item.type, item.value);
+  function handleInspectorLocatorHighlight(button) {
+    if (!elementInspector?.locatorItems) return;
+    setInspectorLocked(true);
     const statusEl = elementInspector.panel.querySelector('[data-inspector-highlight-status]');
-    if (!statusEl) return;
+    const item = elementInspector.locatorItems[Number(button.dataset.inspectorHighlightIndex)];
+    if (!item || !statusEl) return;
 
+    const resolved = resolveLocatorItemNodes(item);
+    const result = resolved.error
+      ? { error: resolved.error, count: 0 }
+      : showInspectorLocatorHighlights(resolved.nodes);
+
+    statusEl.style.display = 'block';
     if (result.error) {
       statusEl.textContent = result.error;
       statusEl.style.color = INSPECTOR_THEME.errorText;
-    } else if (!result.count) {
-      statusEl.textContent = 'No matches found.';
-      statusEl.style.color = INSPECTOR_THEME.warningText;
-    } else {
-      statusEl.textContent = result.count === 1
-        ? 'Highlighted 1 match for 5 seconds.'
-        : `Highlighted ${result.count} matches for 5 seconds.`;
-      statusEl.style.color = result.count === 1
-        ? INSPECTOR_THEME.uniqueText
-        : INSPECTOR_THEME.warningText;
+      return;
     }
-    statusEl.style.display = 'block';
+    if (result.count === 1) {
+      statusEl.textContent = `Highlighted the element for ${Math.round(HIGHLIGHT_DURATION_MS / 1000)} seconds.`;
+      statusEl.style.color = INSPECTOR_THEME.uniqueText;
+    } else {
+      statusEl.textContent = `This locator matches ${result.count} elements. Highlighted all of them.`;
+      statusEl.style.color = INSPECTOR_THEME.warningText;
+    }
   }
 
   function getInspectorLocators(target) {
@@ -407,6 +382,7 @@
     panel.style.left = `${left}px`;
     panel.style.top = `${top}px`;
   }
+
   function bindInspectorDrag(panel) {
     if (panel.dataset.inspectorDragBound === '1') return;
     panel.dataset.inspectorDragBound = '1';
@@ -468,6 +444,14 @@
 
   function ensureElementInspector() {
     if (elementInspector) return elementInspector;
+
+    // Transparent layer over the whole page. It takes every pointer event so the page never sees them.
+    const blocker = document.createElement('div');
+    blocker.setAttribute('data-web-recorder-inspector', 'blocker');
+    Object.assign(blocker.style, {
+      position: 'fixed', inset: '0', zIndex: '2147483646', display: 'none',
+      pointerEvents: 'auto', cursor: 'crosshair', background: 'transparent',
+    });
     const highlight = document.createElement('div');
     highlight.setAttribute('data-web-recorder-inspector', 'highlight');
     Object.assign(highlight.style, {
@@ -492,60 +476,32 @@
       boxShadow: INSPECTOR_THEME.panelShadow, fontFamily: 'system-ui, sans-serif',
       fontSize: '12px', lineHeight: '1.4',
     });
-    panel.addEventListener('mousedown', (event) => {
-      const highlightButton = event.target.closest('[data-inspector-highlight-index]');
-      if (!highlightButton) return;
-      handleInspectorLocatorHighlight(event, highlightButton);
-    }, true);
-    // Keep suggested-locator highlighting attached to the inspector panel.
-    // The implementation lives in highlightSuggestedLocator/showInspectorLocatorHighlights.
 
     panel.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-inspector-copy]');
-      if (button) {
+      const copyButton = event.target.closest('[data-inspector-copy]');
+      if (copyButton) {
         event.preventDefault();
         event.stopPropagation();
-        void copyTextToClipboard(button.dataset.inspectorCopy || '').then(() => {
-          const previous = button.textContent;
-          button.textContent = 'Copied';
-          setTimeout(() => { button.textContent = previous || 'Copy'; }, 900);
+        void copyTextToClipboard(copyButton.dataset.inspectorCopy || '').then(() => {
+          const previous = copyButton.textContent;
+          copyButton.textContent = 'Copied';
+          setTimeout(() => { copyButton.textContent = previous || 'Copy'; }, 900);
         });
         return;
       }
-      if (event.target.closest('[data-inspector-highlight-index]')) {
+      const highlightButton = event.target.closest('[data-inspector-highlight-index]');
+      if (highlightButton) {
         event.preventDefault();
         event.stopPropagation();
-        return;
-      }
-      if (event.target.closest('[data-inspector-match]')) {
-        runInspectorLocatorMatch();
-        return;
-      }
-      const matchRow = event.target.closest('[data-inspector-match-index]');
-      if (matchRow && elementInspector?.matchNodes) {
-        const index = Number(matchRow.dataset.inspectorMatchIndex);
-        const node = elementInspector.matchNodes[index];
-        if (node && typeof node.getBoundingClientRect === 'function') {
-          const positionMatchHighlight = () => {
-            const rect = node.getBoundingClientRect();
-            Object.assign(elementInspector.highlight.style, {
-              display: rect.width && rect.height ? 'block' : 'none',
-              left: `${rect.left}px`,
-              top: `${rect.top}px`,
-              width: `${rect.width}px`,
-              height: `${rect.height}px`,
-            });
-          };
-          node.scrollIntoView({ block: 'center' });
-          requestAnimationFrame(() => requestAnimationFrame(positionMatchHighlight));
-        }
+        handleInspectorLocatorHighlight(highlightButton);
         return;
       }
       if (event.target.closest('[data-inspector-close]')) stopElementInspector();
     });
-    document.documentElement.append(highlightLayer, highlight, panel);
+    document.documentElement.append(blocker, highlightLayer, highlight, panel);
     bindInspectorDrag(panel);
     elementInspector = {
+      blocker,
       highlight,
       highlightLayer,
       panel,
@@ -553,56 +509,9 @@
       dragState: null,
       lastTargetRect: null,
       locatorItems: [],
-      highlightTimer: null,
-      highlightRefreshTimer: null,
-      highlightNodes: [],
-      frozenHighlightRects: [],
+      highlightSession: null,
     };
     return elementInspector;
-  }
-
-  function runInspectorLocatorMatch() {
-    if (!elementInspector) return;
-    const { panel } = elementInspector;
-    const typeSelect = panel.querySelector('[data-inspector-locator-type]');
-    const valueInput = panel.querySelector('[data-inspector-locator]');
-    const errorEl = panel.querySelector('[data-inspector-match-error]');
-    const resultsEl = panel.querySelector('[data-inspector-match-results]');
-    if (!typeSelect || !valueInput || !errorEl || !resultsEl) return;
-
-    inspectorLocked = true;
-    document.documentElement.style.cursor = '';
-
-    const locatorMatch = globalThis.TestifyHubLocatorMatch || {};
-    const query = locatorMatch.queryLocatorMatches
-      || (() => ({ error: 'Locator match unavailable', matches: [] }));
-    const summarize = locatorMatch.summarizeMatch
-      || (() => ({ tag: 'element', text: '', selector: '' }));
-    const result = query(document, typeSelect.value, valueInput.value);
-    const matches = Array.isArray(result.matches) ? result.matches : [];
-    elementInspector.matchNodes = matches;
-
-    if (result.error) {
-      errorEl.textContent = result.error;
-      errorEl.style.display = 'block';
-      resultsEl.innerHTML = '';
-      return;
-    }
-
-    errorEl.textContent = '';
-    errorEl.style.display = 'none';
-
-    if (!matches.length) {
-      resultsEl.innerHTML = '<p style="margin:0;color:' + INSPECTOR_THEME.mutedText + '">No matches found.</p>';
-      return;
-    }
-
-    resultsEl.innerHTML = matches.map((node, index) => {
-      const summary = summarize(node);
-      return `<button type="button" data-inspector-match-index="${index}" style="display:block;width:100%;text-align:left;margin:4px 0;padding:8px;border:1px solid ${INSPECTOR_THEME.divider};border-radius:6px;background:${INSPECTOR_THEME.subtleBg};color:${INSPECTOR_THEME.panelText};cursor:pointer;font:inherit">
-        <strong>${escapeHtml(summary.tag)}</strong> ${escapeHtml(summary.selector)}${summary.text ? ` — ${escapeHtml(summary.text)}` : ''}
-      </button>`;
-    }).join('');
   }
 
   function renderElementInspector(target) {
@@ -627,28 +536,16 @@
           <div style="display:flex;gap:8px;align-items:flex-start">
             <code style="flex:1;overflow-wrap:anywhere;color:${INSPECTOR_THEME.codeText}">${escapeHtml(item.value)}</code>
             <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-              <button type="button" data-inspector-highlight-index="${index}" aria-label="Highlight matches" title="Highlight matches for 5 seconds" style="display:inline-flex;align-items:center;justify-content:center;border:1px solid ${INSPECTOR_THEME.controlBorder};background:${INSPECTOR_THEME.subtleBg};color:#c026d3;border-radius:6px;padding:4px 7px;cursor:pointer;font:inherit">${highlightIcon}</button>
+              <button type="button" data-inspector-highlight-index="${index}" aria-label="Highlight element" title="Highlight element (blinks for ${Math.round(HIGHLIGHT_DURATION_MS / 1000)} seconds)" style="display:inline-flex;align-items:center;justify-content:center;border:1px solid ${INSPECTOR_THEME.controlBorder};background:${INSPECTOR_THEME.subtleBg};color:#c026d3;border-radius:6px;padding:4px 7px;cursor:pointer;font:inherit">${highlightIcon}</button>
               <button type="button" data-inspector-copy="${escapeHtml(item.value)}" style="border:1px solid ${INSPECTOR_THEME.controlBorder};background:${INSPECTOR_THEME.subtleBg};color:${INSPECTOR_THEME.controlText};border-radius:6px;padding:4px 7px;cursor:pointer;font:inherit">Copy</button>
             </div>
           </div>
         </div>`).join('')
       : `<p style="margin:8px 0;color:${INSPECTOR_THEME.warningText}">No unique locator was found for this element.</p>`;
-    const matchTypes = (globalThis.TestifyHubLocatorMatch && globalThis.TestifyHubLocatorMatch.MATCH_LOCATOR_TYPES) || [];
-    const typeOptions = matchTypes.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join('');
-    const matchSection = `<div style="margin-top:12px;padding-top:12px;border-top:1px solid ${INSPECTOR_THEME.divider}">
-        <strong style="display:block;margin-bottom:8px;color:${INSPECTOR_THEME.labelText}">Match locator</strong>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <select data-inspector-locator-type style="border:1px solid ${INSPECTOR_THEME.controlBorder};background:${INSPECTOR_THEME.controlBg};color:${INSPECTOR_THEME.controlText};border-radius:6px;padding:4px 7px;font:inherit">${typeOptions}</select>
-          <input data-inspector-locator type="text" placeholder="Locator value" style="flex:1;min-width:120px;border:1px solid ${INSPECTOR_THEME.controlBorder};background:${INSPECTOR_THEME.controlBg};color:${INSPECTOR_THEME.controlText};border-radius:6px;padding:4px 7px;font:inherit" />
-          <button type="button" data-inspector-match style="border:1px solid ${INSPECTOR_THEME.primaryBtnBorder};background:${INSPECTOR_THEME.primaryBtnBg};color:${INSPECTOR_THEME.primaryBtnText};border-radius:6px;padding:4px 10px;cursor:pointer;font:inherit">Match</button>
-        </div>
-        <div data-inspector-match-error style="color:${INSPECTOR_THEME.errorText};margin-top:6px;display:none"></div>
-        <div data-inspector-match-results style="margin-top:8px"></div>
-      </div>`;
     panel.innerHTML = `<div data-inspector-drag style="display:flex;justify-content:space-between;gap:12px;align-items:start;cursor:move;user-select:none;touch-action:none">
         <div><strong style="font-size:13px">Element inspector</strong><div style="color:${INSPECTOR_THEME.mutedText};margin-top:2px">${escapeHtml(descriptor || tag)} · ${locators.length} unique locator${locators.length === 1 ? '' : 's'}</div></div>
         <button type="button" data-inspector-close style="border:0;background:transparent;color:${INSPECTOR_THEME.closeText};font-size:18px;cursor:pointer;line-height:1" aria-label="Close inspector">×</button>
-      </div>${rows}<div data-inspector-highlight-status style="display:none;margin-top:8px;font-size:11px"></div>${matchSection}<p style="margin:10px 0 0;color:${INSPECTOR_THEME.mutedText}">Drag header to move · Hover to inspect · Click to lock · Esc to close</p>`;
+      </div>${rows}<div data-inspector-highlight-status style="display:none;margin-top:8px;font-size:11px"></div><p style="margin:10px 0 0;color:${INSPECTOR_THEME.mutedText}">Drag header to move · Hover to inspect · Click to lock · Esc to close</p>`;
     panel.style.display = 'block';
     elementInspector.lastTargetRect = {
       left: rect.left,
@@ -660,14 +557,25 @@
       elementInspector.userPosition = null;
     }
     positionInspectorPanel(panel, elementInspector.lastTargetRect, elementInspector.userPosition);
-    elementInspector.matchNodes = [];
+  }
+
+  function setInspectorLocked(locked) {
+    inspectorLocked = locked;
+    if (elementInspector) {
+      elementInspector.blocker.style.cursor = locked ? 'default' : 'crosshair';
+    }
   }
 
   function startElementInspector() {
     ensureElementInspector();
-    inspectorLocked = false;
+    setInspectorLocked(false);
     inspectorActive = true;
-    document.documentElement.style.cursor = 'crosshair';
+    inspectorTarget = null;
+    // Drop focus from any page control so keys cannot act on it while inspecting.
+    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+      document.activeElement.blur();
+    }
+    elementInspector.blocker.style.display = 'block';
     broadcastInspectorState();
     return true;
   }
@@ -675,15 +583,15 @@
   function stopElementInspector() {
     if (!elementInspector) return;
     clearInspectorLocatorHighlights();
+    elementInspector.blocker.style.display = 'none';
     elementInspector.highlight.style.display = 'none';
     elementInspector.panel.style.display = 'none';
     elementInspector.userPosition = null;
     elementInspector.dragState = null;
     elementInspector.lastTargetRect = null;
     inspectorTarget = null;
-    inspectorLocked = false;
+    setInspectorLocked(false);
     inspectorActive = false;
-    document.documentElement.style.cursor = '';
     sendInspectorState(false);
   }
 
@@ -702,30 +610,57 @@
     }
   }
 
-  function handleElementInspectorHover(event) {
+  function isInsideInspectorUi(node) {
+    return Boolean(elementInspector && node && elementInspector.panel.contains(node));
+  }
+
+  // The blocker is on top, so hit-testing skips it while we ask which page element is under the pointer.
+  function elementUnderPointer(clientX, clientY) {
+    const blocker = elementInspector.blocker;
+    blocker.style.pointerEvents = 'none';
+    let element = null;
+    try {
+      element = document.elementFromPoint(clientX, clientY);
+    } finally {
+      blocker.style.pointerEvents = 'auto';
+    }
+    return element instanceof Element ? element : null;
+  }
+
+  function handleInspectorMouseMove(event) {
     if (!inspectorActive || !elementInspector || inspectorLocked) return;
-    const target = event.target;
-    if (!(target instanceof Element) || elementInspector.panel.contains(target)) return;
-    if (target === inspectorTarget) return;
+    if (isInsideInspectorUi(event.target)) return;
+    const target = elementUnderPointer(event.clientX, event.clientY);
+    if (!target || isInsideInspectorUi(target) || target === inspectorTarget) return;
     inspectorTarget = target;
     renderElementInspector(target);
   }
 
-  function handleElementInspectorClick(event) {
-    if (!inspectorActive || !elementInspector || !inspectorTarget || elementInspector.panel.contains(event.target)) return;
-    if (inspectorLocked) {
+  function lockInspectorTarget() {
+    if (inspectorLocked || !inspectorTarget) return;
+    setInspectorLocked(true);
+    renderElementInspector(inspectorTarget);
+  }
+
+  // Runs in the capture phase on window, before any page listener. While the inspector is active,
+  // page pointer and keyboard events are stopped here. Only the inspector panel keeps its own events.
+  function handleInspectorBlockedEvent(event) {
+    if (!inspectorActive || !elementInspector) return;
+    if (event.type === 'keydown' && event.key === 'Escape') {
       event.preventDefault();
       event.stopPropagation();
-      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      stopElementInspector();
       return;
     }
+    if (isInsideInspectorUi(event.target)) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.stopImmediatePropagation) event.stopImmediatePropagation();
-    inspectorLocked = true;
-    document.documentElement.style.cursor = '';
-    renderElementInspector(inspectorTarget);
+    if (event.type === 'click' && event.target === elementInspector.blocker) {
+      lockInspectorTarget();
+    }
   }
+
   function escapeHtml(value) {
     return String(value || '')
       .replace(/&/g, '&amp;')
@@ -734,6 +669,7 @@
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#039;');
   }
+
   async function copyTextToClipboard(value) {
     const text = String(value == null ? '' : value);
     try {
@@ -783,13 +719,8 @@
     }
   });
 
-  document.addEventListener('mousemove', handleElementInspectorHover, true);
-  document.addEventListener('click', handleElementInspectorClick, true);
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && inspectorActive && elementInspector) {
-      event.preventDefault();
-      event.stopPropagation();
-      stopElementInspector();
-    }
-  }, true);
+  BLOCKED_EVENT_TYPES.forEach((type) => {
+    window.addEventListener(type, handleInspectorBlockedEvent, { capture: true, passive: false });
+  });
+  window.addEventListener('mousemove', handleInspectorMouseMove, { capture: true, passive: true });
 })();

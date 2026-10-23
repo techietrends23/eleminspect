@@ -612,6 +612,7 @@
     if (node !== anchor || !nodes.length) return '';
     const segments = nodes.map((segmentNode, index) => {
       const useText = Boolean(options.includeText) && index === nodes.length - 1;
+      if (options.flexible) return buildFlexibleSegmentForNode(segmentNode, { includeText: useText });
       return buildSegmentForNode(segmentNode, { includeText: useText });
     });
     return `${anchorExpr}/${segments.join('/')}`;
@@ -628,10 +629,10 @@
     return '';
   }
 
-  function buildDescendantPathFromAnchor(anchor, target) {
+  function buildDescendantPathFromAnchor(anchor, target, options = {}) {
     const anchorExpr = anchorExpression(anchor);
     if (!anchorExpr || !isDescendantOf(anchor, target) || anchor === target) return '';
-    const targetSegment = buildSegmentForNode(target);
+    const targetSegment = options.flexible ? buildFlexibleSegmentForNode(target) : buildSegmentForNode(target);
     if (!targetSegment.includes('@')) return '';
     return `${anchorExpr}//${targetSegment}`;
   }
@@ -682,45 +683,83 @@
     return anchors;
   }
 
-  function buildAxisPathFromAnchor(anchor, target, axis) {
+  function buildAxisPathFromAnchor(anchor, target, axis, options = {}) {
     if (!anchor || !target || anchor === target) return '';
     const anchorExpr = anchorExpression(anchor);
     if (!anchorExpr) return '';
-    const segment = buildSegmentForNode(target);
+    const segment = options.flexible ? buildFlexibleSegmentForNode(target) : buildSegmentForNode(target);
     if (!segment.includes('@')) return '';
     return `${anchorExpr}/${axis}::${segment}[1]`;
   }
 
-  function xpathAnchoredSelectorsForElement(el) {
-    if (!el || el.nodeType !== 1) return [];
-    const results = [];
-    const add = (xpath, reliability) => {
-      if (!xpath || !isUniqueXPath(xpath, el)) return;
-      results.push(asSelectorResult(xpath, 'xpath', xpath, reliability));
-    };
-
-    findAnchorElements(el).forEach((anchor) => {
-      if (isDescendantOf(anchor, el)) {
-        add(buildUniqueChildPathFromAnchor(anchor, el), anchor === el ? 0.94 : 0.9);
-        add(buildDescendantPathFromAnchor(anchor, el), 0.88);
+  // xpath.md section 2 and 3: contains(), starts-with(), normalize-space() and and-predicates for unstable values.
+  function buildFlexibleSegmentForNode(node, options = {}) {
+    const tag = node.tagName.toLowerCase();
+    const attrParts = [];
+    const id = String(node.id || '').trim();
+    if (id) {
+      if (!isDynamicId(id)) {
+        attrParts.push(`@id=${xpathEscape(id)}`);
+      } else {
+        const prefix = id.replace(/\d+$/, '').replace(/[-_:]+$/, '');
+        if (prefix.length >= 3) attrParts.push(`starts-with(@id, ${xpathEscape(prefix)})`);
       }
-      add(buildSiblingXPathFromAnchor(anchor, el, 'following-sibling'), 0.86);
-      add(buildSiblingXPathFromAnchor(anchor, el, 'preceding-sibling'), 0.84);
-      add(buildAxisPathFromAnchor(anchor, el, 'following'), 0.83);
-      add(buildAxisPathFromAnchor(anchor, el, 'preceding'), 0.81);
-    });
+    }
+    const testId = normalizeText(getStableTestId(node));
+    if (testId) attrParts.push(`@data-testid=${xpathEscape(testId)}`);
+    const stableClasses = Array.from(node.classList || []).filter((c) => c && !isDynamicClassName(c));
+    if (stableClasses.length) attrParts.push(`contains(@class, ${xpathEscape(stableClasses[0])})`);
+    const type = normalizeText(node.getAttribute('type'));
+    if (type) attrParts.push(`@type=${xpathEscape(type)}`);
+    const name = normalizeText(node.getAttribute('name'));
+    if (name) attrParts.push(`@name=${xpathEscape(name)}`);
+    const placeholder = normalizeText(node.getAttribute('placeholder'));
+    if (placeholder) attrParts.push(`@placeholder=${xpathEscape(placeholder)}`);
+    const ariaLabel = normalizeText(node.getAttribute('aria-label'));
+    if (ariaLabel) attrParts.push(`@aria-label=${xpathEscape(ariaLabel)}`);
 
-    return dedupeBySelector(results);
+    if (attrParts.length) return `${tag}[${attrParts.join(' and ')}]`;
+    if (options.includeText) {
+      const text = normalizeText(node.innerText || node.textContent || '');
+      if (text && text.length <= 60) {
+        return `${tag}[contains(normalize-space(.), ${xpathEscape(text.slice(0, 40))})]`;
+      }
+    }
+    return buildSegmentForNode(node);
   }
 
-  function xpathSelectorForElement(el) {
-    const anchored = xpathAnchoredSelectorsForElement(el);
-    if (anchored.length) return anchored[0];
+  // xpath.md section 1: ancestor axis from an anchor that sits inside the target.
+  function buildAncestorPathFromAnchor(anchor, target) {
+    if (!anchor || !target || anchor === target) return '';
+    if (!isDescendantOf(target, anchor)) return '';
+    const anchorExpr = anchorExpression(anchor);
+    if (!anchorExpr) return '';
+    const segment = buildFlexibleSegmentForNode(target);
+    if (!segment.includes('@') && !segment.includes('contains(') && !segment.includes('starts-with(')) return '';
+    return `${anchorExpr}/ancestor::${segment}[1]`;
+  }
 
-    // Try text-based xpath first (more readable and robust)
-    const textXpath = textXPathSelectorForElement(el);
-    if (textXpath) return textXpath;
+  // xpath.md section 4: if the path matches several nodes and the target is first or last, index it.
+  function positionalXPathFor(xpath, targetEl) {
+    if (xpathUsesDuplicateIdAnchor(xpath)) return '';
+    try {
+      const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      const count = result.snapshotLength;
+      for (let i = 0; i < count; i += 1) {
+        if (result.snapshotItem(i) !== targetEl) continue;
+        if (i === 0) return `(${xpath})[1]`;
+        if (i === count - 1) return `(${xpath})[last()]`;
+        return '';
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return '';
+  }
 
+  // Full positional path from the document root, e.g. /html[1]/body[1]/div[2]/span[1].
+  function absoluteXPathForElement(el) {
+    if (!el || el.nodeType !== 1) return '';
     const parts = [];
     let node = el;
     while (node && node.nodeType === 1) {
@@ -732,13 +771,74 @@
       }
       parts.unshift(`${node.tagName.toLowerCase()}[${index}]`);
       node = node.parentElement;
-      if (parts.length >= 6) break;
     }
+    return parts.length ? `/${parts.join('/')}` : '';
+  }
 
-    if (!parts.length) return null;
-    const xpath = `//${parts.join('/')}`;
-    if (!isUniqueXPath(xpath, el)) return null;
-    return asSelectorResult(xpath, 'xpath', xpath, 0.45);
+  // Relative XPath candidates anchored on a unique id or data-testid element.
+  // Returns unique candidates, and positional candidates that only apply when no unique one exists.
+  function anchoredXPathSelectors(el) {
+    const unique = [];
+    const positional = [];
+    const add = (xpath, reliability) => {
+      if (!xpath) return;
+      if (isUniqueXPath(xpath, el)) {
+        unique.push(asSelectorResult(xpath, 'xpath', xpath, reliability));
+        return;
+      }
+      const indexed = positionalXPathFor(xpath, el);
+      if (indexed) positional.push(asSelectorResult(indexed, 'xpath', indexed, reliability - 0.2));
+    };
+
+    findAnchorElements(el).forEach((anchor) => {
+      if (isDescendantOf(anchor, el)) {
+        add(buildChildPathFromAnchor(anchor, el), anchor === el ? 0.94 : 0.9);
+        add(buildChildPathFromAnchor(anchor, el, { includeText: true }), 0.89);
+        add(buildChildPathFromAnchor(anchor, el, { flexible: true }), 0.87);
+        add(buildDescendantPathFromAnchor(anchor, el), 0.88);
+        add(buildDescendantPathFromAnchor(anchor, el, { flexible: true }), 0.86);
+      }
+      if (isDescendantOf(el, anchor) && anchor !== el) {
+        add(buildAncestorPathFromAnchor(anchor, el), 0.82);
+      }
+      add(buildSiblingXPathFromAnchor(anchor, el, 'following-sibling'), 0.86);
+      add(buildSiblingXPathFromAnchor(anchor, el, 'preceding-sibling'), 0.84);
+      add(buildAxisPathFromAnchor(anchor, el, 'following'), 0.83);
+      add(buildAxisPathFromAnchor(anchor, el, 'preceding'), 0.81);
+      add(buildAxisPathFromAnchor(anchor, el, 'following', { flexible: true }), 0.8);
+    });
+
+    return {
+      unique: dedupeBySelector(unique),
+      positional: dedupeBySelector(positional),
+    };
+  }
+
+  function xpathAnchoredSelectorsForElement(el) {
+    if (!el || el.nodeType !== 1) return [];
+    const { unique, positional } = anchoredXPathSelectors(el);
+    return unique.length ? unique : positional;
+  }
+
+  function shortestSelector(items) {
+    return items.reduce((best, item) => (item.selector.length < best.selector.length ? item : best));
+  }
+
+  // One XPath per element: the shortest unique path relative to a unique id/testid anchor.
+  // Falls back to an indexed anchored path, then to the absolute path from the document root.
+  function xpathSelectorForElement(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const { unique, positional } = anchoredXPathSelectors(el);
+    const textAnchored = anchoredTextXPathSelectorForElement(el);
+    const pool = [...unique, textAnchored].filter(Boolean);
+    if (pool.length) return shortestSelector(pool);
+    if (positional.length) return shortestSelector(positional);
+
+    const absolute = absoluteXPathForElement(el);
+    if (absolute && isUniqueXPath(absolute, el)) {
+      return asSelectorResult(absolute, 'xpath', absolute, 0.45);
+    }
+    return null;
   }
 
   function dedupeBySelector(items) {
@@ -772,16 +872,14 @@
     let primary = candidates[0] || cssSelectorForElement(el);
 
     const primaryReliability = Number(primary?.reliability) || 0;
-    if (primaryReliability < 0.72) {
-      const xpathFallback = dedupeBySelector([
-        anchoredTextXPathSelectorForElement(el),
-        xpathSelectorForElement(el),
-      ].filter(Boolean));
-      if (xpathFallback.length) {
-        candidates = dedupeBySelector([...candidates, ...xpathFallback]);
-        candidates.sort((a, b) => (b.reliability || 0) - (a.reliability || 0));
-        primary = candidates[0] || primary;
-      }
+    // Always attach one XPath (shortest unique anchored path, else absolute).
+    const xpathCandidate = xpathSelectorForElement(el);
+    if (xpathCandidate) {
+      candidates = dedupeBySelector([...candidates, xpathCandidate]);
+    }
+    if (primaryReliability < 0.72 && xpathCandidate) {
+      candidates.sort((a, b) => (b.reliability || 0) - (a.reliability || 0));
+      primary = candidates[0] || primary;
     }
 
     if (!primary) {
