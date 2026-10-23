@@ -1,0 +1,11 @@
+# Build output and local tooling
+dist/
+.build-tools/
+node_modules/
+
+# Signing keys must never be committed
+*.pem
+*.crx
+*.zip
+
+.DS_Store

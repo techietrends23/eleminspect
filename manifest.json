@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "eleminspect",
+  "version": "1.0.0",
+  "description": "Inspect any web element and copy its unique locators.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "selector-generator.js",
+        "element-check-catalog.js",
+        "locator-match.js",
+        "content-script.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "action": {
+    "default_title": "eleminspect",
+    "default_popup": "popup.html"
+  },
+  "devtools_page": "devtools.html"
+}

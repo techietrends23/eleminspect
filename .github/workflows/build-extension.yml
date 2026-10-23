@@ -1,0 +1,58 @@
+name: Build eleminspect extension
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-extension
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check JavaScript and manifest
+        run: |
+          for file in $(git ls-files '*.js'); do
+            node --check "$file"
+          done
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'))"
+
+      - name: Install packer
+        run: npm install --prefix .build-tools crx@5.0.1
+
+      - name: Build .crx and .zip
+        env:
+          EXTENSION_PEM: ${{ secrets.EXTENSION_PEM }}
+        run: node scripts/build-extension.js
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eleminspect-extension
+          path: dist/*
+
+      - name: Update the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
+            dist/eleminspect.crx \
+            dist/eleminspect.zip \
+            --target "$GITHUB_SHA" \
+            --title "eleminspect (latest build)" \
+            --notes-file dist/RELEASE_NOTES.md

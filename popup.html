@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>eleminspect</title>
+  <link rel="stylesheet" href="styles/panel.css" />
+</head>
+<body class="panel-body">
+  <main class="panel">
+    <header>
+      <h1>eleminspect</h1>
+      <p>Hover any element, click to lock it, then copy a unique locator.</p>
+    </header>
+    <div class="controls">
+      <button id="btn-inspect" class="primary">Inspect element</button>
+      <button id="btn-stop" class="danger hidden">Stop inspecting</button>
+    </div>
+    <p id="status" class="status">Idle</p>
+  </main>
+  <script src="inspector-controls.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
