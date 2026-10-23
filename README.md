@@ -2,9 +2,9 @@
 
 **eleminspect** is a Chrome extension for test automation and web scraping. Hover over any element on a page, lock it, and get the locators you can use in your tests: unique IDs, roles, text, CSS selectors, and XPath. Every locator shown has been checked to match only that one element on the page.
 
-[![Watch the eleminspect demo](https://img.youtube.com/vi/LZ6M5he3vOQ/hqdefault.jpg)](https://youtu.be/LZ6M5he3vOQ)
+![eleminspect demo](docs/demo.gif)
 
-*Click the preview to watch the demo on YouTube.*
+Full demo video on YouTube: [youtu.be/LZ6M5he3vOQ](https://youtu.be/LZ6M5he3vOQ)
 
 ## Features
 
